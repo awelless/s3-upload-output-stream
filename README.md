@@ -9,24 +9,25 @@ String bucket = "some.bucket";
 String key = "some.key";
 int bufferSize = 10 * 1024 * 1024; // default buffer size is 10 MB
 
-// stream shouldn't be opened in try-with-resources, because part upload can run after .close()  
-S3UploadOutputStream outputStream = new S3UploadOutputStream(s3Client, bucket, key, bufferSize);
+// use this CompletableFuture to have an access to CompleteMultipartUploadResponse when multipart upload is completed 
+CompletableFuture<CompleteMultipartUploadResponse> completion;
 
-try {
+try (S3UploadOutputStream outputStream = new S3UploadOutputStream(s3Client, bucket, key, bufferSize)) {
+    completion = outputStream.getCompletion();
+    
     // write data to stream
     outputStream.write(1);
     outputStream.write(2);
     outputStream.write(3);
+
 } catch (IOException e) {
-} finally {
-    try {
-        outputStream.close();
-    } catch (IOException e) {
-    }
+    // error handling
+    completion = new CompletableFuture<>();
+    completion.completeExceptionally(e);
 }
 
-// when stream is closed some part uploads can be still running
-CompletableFuture<CompleteMultipartUploadResponse> completionFuture = outputStream.getCompletionFuture();
+// when stream is closed some part uploads can still be running
 
-// further processing...
+// we can continue working asynchronously or simply call completion.get()
+completion.thenAccept(response -> System.out.println("Multipart upload is finished. Uri: " + response.location()));
 ```
