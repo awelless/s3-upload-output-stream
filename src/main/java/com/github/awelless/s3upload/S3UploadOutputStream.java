@@ -28,7 +28,7 @@ public class S3UploadOutputStream extends OutputStream {
     private final String key;
 
     private final int bufferSize;
-    private final byte[] buffer;
+    private byte[] buffer; // mutable, so it can be dropped when steam is closed
 
     private int bufferWriteIndex = 0;
 
@@ -112,6 +112,8 @@ public class S3UploadOutputStream extends OutputStream {
         }
 
         closeFuture.complete(null);
+
+        buffer = null; // no writes happen when stream is closed, therefore buffer can be dropped
     }
 
     private void assertOpen() throws IOException {
