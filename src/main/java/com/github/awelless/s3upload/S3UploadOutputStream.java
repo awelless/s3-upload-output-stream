@@ -32,8 +32,10 @@ public class S3UploadOutputStream extends OutputStream {
 
     private int bufferWriteIndex = 0;
 
-    private final CompletableFuture<Void> closeFuture = new CompletableFuture<>();
+    private boolean closed = false;
+
     private final CompletableFuture<String> uploadIdFuture = new CompletableFuture<>();
+    private final CompletableFuture<CompleteMultipartUploadResponse> completionFuture = new CompletableFuture<>();
     private final List<CompletableFuture<CompletedPart>> completedPartFutures = new ArrayList<>();
 
     public S3UploadOutputStream(S3AsyncClient s3Client, String bucket, String key) {
@@ -49,10 +51,10 @@ public class S3UploadOutputStream extends OutputStream {
     }
 
     @Override
-    public void write(int i) throws IOException {
+    public void write(int b) throws IOException {
         assertOpen();
 
-        buffer[bufferWriteIndex++] = (byte) i;
+        buffer[bufferWriteIndex++] = (byte) b;
 
         if (bufferWriteIndex == bufferSize) {
             flush();
@@ -102,37 +104,22 @@ public class S3UploadOutputStream extends OutputStream {
 
     @Override
     public void close() throws IOException {
-        if (closeFuture.isDone()) {
+        if (closed) {
             return;
         }
+
+        closed = true;
 
         // if buffer has some data, flush it
         if (bufferWriteIndex > 0) {
             flush();
         }
 
-        closeFuture.complete(null);
+        CompletableFuture.allOf(completedPartFutures.toArray(new CompletableFuture[0])) // wait till all part uploads are done
+                .thenCompose(unused2 -> completeMultipartUpload())
+                .thenApply(completionFuture::complete);
 
         buffer = null; // no writes happen when stream is closed, therefore buffer can be dropped
-    }
-
-    private void assertOpen() throws IOException {
-        if (closeFuture.isDone()) {
-            throw new IOException("Stream is closed");
-        }
-    }
-
-    /**
-     * Returns {@link CompletableFuture} that completes only when stream is closed and upload is finished.
-     * <br>
-     * <b>Note: DO NOT call {@link CompletableFuture#get()} on returned future
-     * while {@link S3UploadOutputStream} is not closed</b>
-     */
-    public CompletableFuture<CompleteMultipartUploadResponse> getCompletion() {
-        return closeFuture.thenCompose(unused1 -> // wait till stream is closed
-                CompletableFuture.allOf(completedPartFutures.toArray(new CompletableFuture[0])) // wait till all part uploads are done
-                        .thenCompose(unused2 -> completeMultipartUpload())
-        );
     }
 
     private CompletableFuture<CompleteMultipartUploadResponse> completeMultipartUpload() {
@@ -140,6 +127,8 @@ public class S3UploadOutputStream extends OutputStream {
         List<CompletedPart> completedParts = completedPartFutures.stream()
                 .map(CompletableFuture::join) // all upload features are completed
                 .collect(toList());
+
+        completedPartFutures.clear(); // after retrieving all CompletedParts, futures can be dropped
 
         // and complete upload request
         CompleteMultipartUploadRequest completeRequest = CompleteMultipartUploadRequest.builder()
@@ -151,5 +140,21 @@ public class S3UploadOutputStream extends OutputStream {
                 .build();
 
         return s3Client.completeMultipartUpload(completeRequest);
+    }
+
+    private void assertOpen() throws IOException {
+        if (closed) {
+            throw new IOException("Stream is closed");
+        }
+    }
+
+    /**
+     * Returns {@link CompletableFuture} that completes only when stream is closed and upload is finished.
+     * <br>
+     * <b>Note: DO NOT call {@link CompletableFuture#get()} on returned future
+     * while {@link S3UploadOutputStream} is not closed</b>
+     */
+    public CompletableFuture<CompleteMultipartUploadResponse> getCompletion() {
+        return completionFuture;
     }
 }
