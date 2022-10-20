@@ -9,7 +9,6 @@ import software.amazon.awssdk.services.s3.model.CompletedPart;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.UploadPartRequest;
-import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -35,7 +34,7 @@ public class S3UploadOutputStream extends OutputStream {
 
     private final CompletableFuture<Void> closeFuture = new CompletableFuture<>();
     private final CompletableFuture<String> uploadIdFuture = new CompletableFuture<>();
-    private final List<CompletableFuture<OrderedUploadPartResponse>> uploadPartFutures = new ArrayList<>();
+    private final List<CompletableFuture<CompletedPart>> completedPartFutures = new ArrayList<>();
 
     public S3UploadOutputStream(S3AsyncClient s3Client, String bucket, String key) {
         this(s3Client, bucket, key, DEFAULT_MAX_BUFFER_SIZE);
@@ -64,13 +63,13 @@ public class S3UploadOutputStream extends OutputStream {
     public void flush() throws IOException {
         assertOpen();
 
-        if (uploadPartFutures.isEmpty()) {
+        if (completedPartFutures.isEmpty()) {
             createMultipartUpload()
                     .thenAccept(response -> uploadIdFuture.complete(response.uploadId()));
         }
 
-        CompletableFuture<OrderedUploadPartResponse> uploadPartFuture = uploadIdFuture.thenCompose(this::uploadPart);
-        uploadPartFutures.add(uploadPartFuture);
+        CompletableFuture<CompletedPart> completedPartFuture = uploadIdFuture.thenCompose(this::uploadPart);
+        completedPartFutures.add(completedPartFuture);
 
         bufferWriteIndex = 0;
     }
@@ -84,8 +83,8 @@ public class S3UploadOutputStream extends OutputStream {
         return s3Client.createMultipartUpload(request);
     }
 
-    private CompletableFuture<OrderedUploadPartResponse> uploadPart(String uploadId) {
-        int partNumber = uploadPartFutures.size() + 1;
+    private CompletableFuture<CompletedPart> uploadPart(String uploadId) {
+        int partNumber = completedPartFutures.size() + 1;
 
         UploadPartRequest request = UploadPartRequest.builder()
                 .bucket(bucket)
@@ -95,12 +94,17 @@ public class S3UploadOutputStream extends OutputStream {
                 .build();
 
         return s3Client.uploadPart(request, AsyncRequestBody.fromBytes(Arrays.copyOf(buffer, bufferWriteIndex)))
-                .thenApply(uploadPartResponse -> new OrderedUploadPartResponse(partNumber, uploadPartResponse));
+                .thenApply(uploadPartResponse -> CompletedPart.builder()
+                        .partNumber(partNumber)
+                        .eTag(uploadPartResponse.eTag())
+                        .build());
     }
 
     @Override
     public void close() throws IOException {
-        assertOpen();
+        if (closeFuture.isDone()) {
+            return;
+        }
 
         // if buffer has some data, flush it
         if (bufferWriteIndex > 0) {
@@ -124,16 +128,15 @@ public class S3UploadOutputStream extends OutputStream {
      */
     public CompletableFuture<CompleteMultipartUploadResponse> getCompletion() {
         return closeFuture.thenCompose(unused1 -> // wait till stream is closed
-                CompletableFuture.allOf(uploadPartFutures.toArray(new CompletableFuture[0])) // wait till all part uploads are done
+                CompletableFuture.allOf(completedPartFutures.toArray(new CompletableFuture[0])) // wait till all part uploads are done
                         .thenCompose(unused2 -> completeMultipartUpload())
         );
     }
 
     private CompletableFuture<CompleteMultipartUploadResponse> completeMultipartUpload() {
         // create completed parts
-        List<CompletedPart> completedParts = uploadPartFutures.stream()
+        List<CompletedPart> completedParts = completedPartFutures.stream()
                 .map(CompletableFuture::join) // all upload features are completed
-                .map(OrderedUploadPartResponse::toCompletedPart)
                 .collect(toList());
 
         // and complete upload request
@@ -146,23 +149,5 @@ public class S3UploadOutputStream extends OutputStream {
                 .build();
 
         return s3Client.completeMultipartUpload(completeRequest);
-    }
-
-    private static class OrderedUploadPartResponse {
-
-        private final int uploadPartNumber;
-        private final UploadPartResponse uploadPartResponse;
-
-        private OrderedUploadPartResponse(int uploadPartNumber, UploadPartResponse uploadPartResponse) {
-            this.uploadPartNumber = uploadPartNumber;
-            this.uploadPartResponse = uploadPartResponse;
-        }
-
-        CompletedPart toCompletedPart() {
-            return CompletedPart.builder()
-                    .partNumber(uploadPartNumber)
-                    .eTag(uploadPartResponse.eTag())
-                    .build();
-        }
     }
 }
