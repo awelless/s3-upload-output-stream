@@ -70,7 +70,11 @@ public class S3UploadOutputStream extends OutputStream {
                     .thenAccept(response -> uploadIdFuture.complete(response.uploadId()));
         }
 
-        CompletableFuture<CompletedPart> completedPartFuture = uploadIdFuture.thenCompose(this::uploadPart);
+        // all mutable values should never be calculated in future lambda body
+        byte[] bufferCopy = Arrays.copyOf(buffer, bufferWriteIndex);
+        int partNumber = completedPartFutures.size() + 1;
+        CompletableFuture<CompletedPart> completedPartFuture = uploadIdFuture.thenCompose(uploadId -> uploadPart(uploadId, bufferCopy, partNumber));
+
         completedPartFutures.add(completedPartFuture);
 
         bufferWriteIndex = 0;
@@ -85,9 +89,7 @@ public class S3UploadOutputStream extends OutputStream {
         return s3Client.createMultipartUpload(request);
     }
 
-    private CompletableFuture<CompletedPart> uploadPart(String uploadId) {
-        int partNumber = completedPartFutures.size() + 1;
-
+    private CompletableFuture<CompletedPart> uploadPart(String uploadId, byte[] buffer, int partNumber) {
         UploadPartRequest request = UploadPartRequest.builder()
                 .bucket(bucket)
                 .key(key)
@@ -95,7 +97,7 @@ public class S3UploadOutputStream extends OutputStream {
                 .partNumber(partNumber)
                 .build();
 
-        return s3Client.uploadPart(request, AsyncRequestBody.fromBytes(Arrays.copyOf(buffer, bufferWriteIndex)))
+        return s3Client.uploadPart(request, AsyncRequestBody.fromBytes(buffer))
                 .thenApply(uploadPartResponse -> CompletedPart.builder()
                         .partNumber(partNumber)
                         .eTag(uploadPartResponse.eTag())
@@ -108,16 +110,22 @@ public class S3UploadOutputStream extends OutputStream {
             return;
         }
 
-        closed = true;
-
         // if buffer has some data, flush it
         if (bufferWriteIndex > 0) {
             flush();
         }
 
+        closed = true;
+
         CompletableFuture.allOf(completedPartFutures.toArray(new CompletableFuture[0])) // wait till all part uploads are done
                 .thenCompose(unused2 -> completeMultipartUpload())
-                .thenApply(completionFuture::complete);
+                .whenComplete((response, error) -> {
+                    if (error != null) {
+                        completionFuture.completeExceptionally(error);
+                    } else {
+                        completionFuture.complete(response);
+                    }
+                });
 
         buffer = null; // no writes happen when stream is closed, therefore buffer can be dropped
     }
@@ -131,15 +139,18 @@ public class S3UploadOutputStream extends OutputStream {
         completedPartFutures.clear(); // after retrieving all CompletedParts, futures can be dropped
 
         // and complete upload request
-        CompleteMultipartUploadRequest completeRequest = CompleteMultipartUploadRequest.builder()
-                .bucket(bucket)
-                .key(key)
-                .multipartUpload(CompletedMultipartUpload.builder()
-                        .parts(completedParts)
-                        .build())
-                .build();
+        return uploadIdFuture.thenCompose(uploadId -> {
+            CompleteMultipartUploadRequest completeRequest = CompleteMultipartUploadRequest.builder()
+                    .bucket(bucket)
+                    .key(key)
+                    .uploadId(uploadId)
+                    .multipartUpload(CompletedMultipartUpload.builder()
+                            .parts(completedParts)
+                            .build())
+                    .build();
 
-        return s3Client.completeMultipartUpload(completeRequest);
+            return s3Client.completeMultipartUpload(completeRequest);
+        });
     }
 
     private void assertOpen() throws IOException {
